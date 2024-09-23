@@ -92,10 +92,10 @@ struct RequestData : NonCopyable {
 	bool isValid() { return response.isValid(); }
 
 	// Initializes the request state and starts it, possibly after a backoff delay
-	void startRequest(double backoff,
-	                  bool triedAllOptions,
-	                  RequestStream<Request> const* stream,
-	                  Request const& request,
+	void startRequest(double backoff,//延迟时间
+	                  bool triedAllOptions,//是否尝试了所有选项
+	                  RequestStream<Request> const* stream,//请求流
+	                  Request const& request,//具体的请求
 	                  QueueModel* model) {
 		modelHolder = Reference<ModelHolder>();
 		requestStarted = false;
@@ -110,9 +110,10 @@ struct RequestData : NonCopyable {
 		} else {
 			requestStarted = true;
 			modelHolder = Reference<ModelHolder>(new ModelHolder(model, stream->getEndpoint().token.first()));
+			//发送请求，等待响应
 			response = stream->tryGetReply(request);
 		}
-
+		//更新请求状态
 		requestProcessed = false;
 		this->triedAllOptions = triedAllOptions;
 	}
@@ -241,33 +242,39 @@ struct RequestData : NonCopyable {
 // interfaces. If too many interfaces in the same DC are bad, try remote interfaces.
 ACTOR template <class Interface, class Request, class Multi>
 Future<REPLY_TYPE(Request)> loadBalance(
-    Reference<MultiInterface<Multi>> alternatives,
-    RequestStream<Request> Interface::*channel,
-    Request request = Request(),
-    TaskPriority taskID = TaskPriority::DefaultPromiseEndpoint,
-    bool atMostOnce = false, // if true, throws request_maybe_delivered() instead of retrying automatically
-    QueueModel* model = nullptr) {
+    Reference<MultiInterface<Multi>> alternatives,//备选服务器集合
+    RequestStream<Request> Interface::*channel, //请求的通信通道
+    Request request = Request(), //要发送的实际请求
+    TaskPriority taskID = TaskPriority::DefaultPromiseEndpoint,//任务优先级
+    bool atMostOnce = false, // if true, throws request_maybe_delivered() instead of retrying automatically 请求只发送一次
+    QueueModel* model = nullptr) { //队列模型，默认为空，用于负载均衡
 
+	//状态变量，用于管理第一个和第二个请求的数据结构
 	state RequestData<Request> firstRequestData;
 	state RequestData<Request> secondRequestData;
 
+	//第一个请求的终端点标识符
 	state Optional<uint64_t> firstRequestEndpoint;
 	state Future<Void> secondDelay = Never();
 
-	state Promise<Void> requestFinished;
+	state Promise<Void> requestFinished;//标记请求是否完成
 	state double startTime = now();
-
+	//设置请求优先级
 	setReplyPriority(request, taskID);
+
+	//确保至少有1个可选服务器
 	if (!alternatives)
 		return Never();
-
 	ASSERT(alternatives->size());
 
+	//随机选择初始的最佳服务器和next备选服务器
 	state int bestAlt = deterministicRandom()->randomInt(0, alternatives->countBest());
 	state int nextAlt = deterministicRandom()->randomInt(0, std::max(alternatives->size() - 1, 1));
+	//确保这两个服务器不重合
 	if (nextAlt >= bestAlt)
 		nextAlt++;
-
+	//如果提供了队列模型，计算每个备选服务器的负载均衡指标
+	//选择最佳和次佳的备选服务器，并确定是否需要延迟向次佳服务器发送请求
 	if (model) {
 		double bestMetric = 1e9; // Storage server with the least outstanding requests.
 		double nextMetric = 1e9;
@@ -275,6 +282,7 @@ Future<REPLY_TYPE(Request)> loadBalance(
 		double nextTime = 1e9;
 		int badServers = 0;
 
+		//遍历所有服务器，根据请求队列长度、延迟等指标选择最佳和次佳服务器
 		for (int i = 0; i < alternatives->size(); i++) {
 			// countBest(): the number of alternatives in the same locality (i.e., DC by default) as alternatives[0].
 			// if the if-statement is correct, it won't try to send requests to the remote ones.
@@ -286,6 +294,7 @@ Future<REPLY_TYPE(Request)> loadBalance(
 				break;
 			}
 
+			//获取第i个备选服务器的流
 			RequestStream<Request> const* thisStream = &alternatives->get(i, channel);
 			if (!IFailureMonitor::failureMonitor().getState(thisStream->getEndpoint()).failed) {
 				auto& qd = model->getMeasurement(thisStream->getEndpoint().token.first());
@@ -362,7 +371,9 @@ Future<REPLY_TYPE(Request)> loadBalance(
 	state double backoff = 0;
 	state bool triedAllOptions = false;
 	// Issue requests to selected servers.
+	//开始循环尝试发送请求
 	loop {
+		//如果请求持续时间超过阈值，记录一个警告事件，并详细记录尝试次数、退避时间等信息
 		if (now() - startTime > (g_network->isSimulated() ? 30.0 : 600.0)) {
 			TraceEvent ev(g_network->isSimulated() ? SevWarn : SevWarnAlways, "LoadBalanceTooLong");
 			ev.suppressFor(1.0);
@@ -385,6 +396,7 @@ Future<REPLY_TYPE(Request)> loadBalance(
 		// Find an alternative, if any, that is not failed, starting with
 		// nextAlt. This logic matters only if model == nullptr. Otherwise, the
 		// bestAlt and nextAlt have been decided.
+		//尝试找到一个可用的服务器
 		state RequestStream<Request> const* stream = NULL;
 		for (int alternativeNum = 0; alternativeNum < alternatives->size(); alternativeNum++) {
 			int useAlt = nextAlt;
@@ -402,7 +414,7 @@ Future<REPLY_TYPE(Request)> loadBalance(
 				triedAllOptions = true;
 			stream = NULL;
 		}
-
+		//如果所有服务器都失败了，等待其中一个恢复，根据不同的延迟策略，决定等待多长时间或立刻抛出异常
 		if (!stream && !firstRequestData.isValid()) {
 			// Everything is down!  Wait for someone to be up.
 
@@ -452,6 +464,7 @@ Future<REPLY_TYPE(Request)> loadBalance(
 			}
 
 			numAttempts = 0; // now that we've got a server back, reset the backoff
+		//如果只有第一个请求可用，处理第一个请求的响应
 		} else if (!stream) {
 			// Only the first location is available.
 			ErrorOr<REPLY_TYPE(Request)> result = wait(firstRequestData.response);
@@ -460,6 +473,7 @@ Future<REPLY_TYPE(Request)> loadBalance(
 			}
 
 			firstRequestEndpoint = Optional<uint64_t>();
+		//如果第一个请求已发送且响应时间过长，发送第二个请求，等待其中之一响应
 		} else if (firstRequestData.isValid()) {
 			// Issue a second request, the first one is taking a long time.
 			secondRequestData.startRequest(backoff, triedAllOptions, stream, request, model);
@@ -475,6 +489,7 @@ Future<REPLY_TYPE(Request)> loadBalance(
 					firstRequestEndpoint = Optional<uint64_t>();
 					firstFinished = true;
 				}
+				//等待请求的响应response
 				when(ErrorOr<REPLY_TYPE(Request)> result = wait(secondRequestData.response)) {
 					if (secondRequestData.checkAndProcessResult(atMostOnce)) {
 						return result.get();
@@ -491,6 +506,7 @@ Future<REPLY_TYPE(Request)> loadBalance(
 			}
 		} else {
 			// Issue a request, if it takes too long to get a reply, go around the loop
+			//这里是重点，发送请求
 			firstRequestData.startRequest(backoff, triedAllOptions, stream, request, model);
 			firstRequestEndpoint = stream->getEndpoint().token.first();
 
@@ -529,7 +545,7 @@ Future<REPLY_TYPE(Request)> loadBalance(
 				    std::max(FLOW_KNOBS->LOAD_BALANCE_START_BACKOFF, backoff * FLOW_KNOBS->LOAD_BALANCE_BACKOFF_RATE));
 			}
 		}
-
+		//更新备选服务器索引并重置相关状态
 		nextAlt = (nextAlt + 1) % alternatives->size();
 		if (nextAlt == startAlt)
 			triedAllOptions = true;
@@ -549,11 +565,13 @@ Optional<BasicLoadBalancedReply> getBasicLoadBalancedReply(const BasicLoadBalanc
 Optional<BasicLoadBalancedReply> getBasicLoadBalancedReply(const void*);
 
 // A simpler version of LoadBalance that does not send second requests where the list of servers are always fresh
+//在多个可能的服务器之间进行负载均衡，以处理传入的请求。该函数没有发送第二个请求，并假设服务器列表总是最新的
+//实现了一个基本的负载均衡算法，通过循环遍历多个服务器，找到一个可用的服务器来处理请求。如果所有服务器都不可用，等待至少一个服务器恢复可用。通过backoff机制和错误处理，提高了请求的成功率和稳定性
 ACTOR template <class Interface, class Request, class Multi>
-Future<REPLY_TYPE(Request)> basicLoadBalance(Reference<ModelInterface<Multi>> alternatives,
-                                             RequestStream<Request> Interface::*channel,
-                                             Request request = Request(),
-                                             TaskPriority taskID = TaskPriority::DefaultPromiseEndpoint,
+Future<REPLY_TYPE(Request)> basicLoadBalance(Reference<ModelInterface<Multi>> alternatives,//可用的服务器接口引用
+                                             RequestStream<Request> Interface::*channel,//接口的请求流指针
+                                             Request request = Request(),//要发送的请求
+                                             TaskPriority taskID = TaskPriority::DefaultPromiseEndpoint,//任务优先级
                                              bool atMostOnce = false) {
 	setReplyPriority(request, taskID);
 	if (!alternatives)
@@ -561,19 +579,21 @@ Future<REPLY_TYPE(Request)> basicLoadBalance(Reference<ModelInterface<Multi>> al
 
 	ASSERT(alternatives->size() && alternatives->alwaysFresh());
 
-	state int bestAlt = alternatives->getBest();
+	state int bestAlt = alternatives->getBest(); //最佳服务器索引
+	//下一个尝试的服务器索引
 	state int nextAlt = deterministicRandom()->randomInt(0, std::max(alternatives->size() - 1, 1));
 	if (nextAlt >= bestAlt)
 		nextAlt++;
-
+	//初始尝试的服务器索引
 	state int startAlt = nextAlt;
+	//从最佳服务器到初始服务器的距离
 	state int startDistance = (bestAlt + alternatives->size() - startAlt) % alternatives->size();
-
-	state int numAttempts = 0;
-	state double backoff = 0;
-	state int useAlt;
+	state int numAttempts = 0;//尝试次数
+	state double backoff = 0;//回避时间
+	state int useAlt;//当前使用的服务器索引
 	loop {
 		// Find an alternative, if any, that is not failed, starting with nextAlt
+		//从nextAlt开始，尝试找到一个可用的服务器
 		state RequestStream<Request> const* stream = NULL;
 		for (int alternativeNum = 0; alternativeNum < alternatives->size(); alternativeNum++) {
 			useAlt = nextAlt;
@@ -581,14 +601,14 @@ Future<REPLY_TYPE(Request)> basicLoadBalance(Reference<ModelInterface<Multi>> al
 				useAlt = bestAlt;
 			else if ((nextAlt + alternatives->size() - startAlt) % alternatives->size() <= startDistance)
 				useAlt = (nextAlt + alternatives->size() - 1) % alternatives->size();
-
+			//找到可用的服务器后，将其请求流赋值给stream并break
 			stream = &alternatives->get(useAlt, channel);
 			if (!IFailureMonitor::failureMonitor().getState(stream->getEndpoint()).failed)
 				break;
 			nextAlt = (nextAlt + 1) % alternatives->size();
 			stream = NULL;
 		}
-
+		//如果所有服务器都不可用，等待至少一个服务器恢复可用
 		if (!stream) {
 			// Everything is down!  Wait for someone to be up.
 
@@ -601,12 +621,13 @@ Future<REPLY_TYPE(Request)> basicLoadBalance(Reference<ModelInterface<Multi>> al
 
 			numAttempts = 0; // now that we've got a server back, reset the backoff
 		} else {
+			//等待backoff的时间
 			if (backoff > 0.0) {
 				wait(delay(backoff));
 			}
-
+			//发送请求并等待响应
 			ErrorOr<REPLY_TYPE(Request)> result = wait(stream->tryGetReply(request));
-
+			//如果成功获取响应，更新服务器的负载信息并返回响应
 			if (result.present()) {
 				Optional<BasicLoadBalancedReply> loadBalancedReply = getBasicLoadBalancedReply(&result.get());
 				if (loadBalancedReply.present()) {
@@ -615,7 +636,7 @@ Future<REPLY_TYPE(Request)> basicLoadBalance(Reference<ModelInterface<Multi>> al
 
 				return result.get();
 			}
-
+			//错误处理
 			if (result.getError().code() != error_code_broken_promise &&
 			    result.getError().code() != error_code_request_maybe_delivered) {
 				throw result.getError();
@@ -624,14 +645,14 @@ Future<REPLY_TYPE(Request)> basicLoadBalance(Reference<ModelInterface<Multi>> al
 			if (atMostOnce) {
 				throw request_maybe_delivered();
 			}
-
+			//设置backoff
 			if (++numAttempts >= alternatives->size()) {
 				backoff = std::min(
 				    FLOW_KNOBS->LOAD_BALANCE_MAX_BACKOFF,
 				    std::max(FLOW_KNOBS->LOAD_BALANCE_START_BACKOFF, backoff * FLOW_KNOBS->LOAD_BALANCE_BACKOFF_RATE));
 			}
 		}
-
+		//更新nextAlt为下一个服务器索引，重置请求的回复状态
 		nextAlt = (nextAlt + 1) % alternatives->size();
 		resetReply(request, taskID);
 	}

@@ -1810,6 +1810,7 @@ ACTOR Future<Void> updateLastCommit(ProxyCommitData* self, Optional<UID> debugID
 	return Void();
 }
 
+//proxy获取当前最大的提交版本号
 ACTOR Future<GetReadVersionReply> getLiveCommittedVersion(ProxyCommitData* commitData,
                                                           uint32_t flags,
                                                           vector<MasterProxyInterface>* otherProxies,
@@ -1823,43 +1824,53 @@ ACTOR Future<GetReadVersionReply> getLiveCommittedVersion(ProxyCommitData* commi
 	// before the request returns, so it is committed. (2) No proxy on our list reported committed a higher version
 	// before this request was received, because then its committedVersion would have been higher,
 	//     and no other proxy could have already committed anything without first ending the epoch
+	//增加批量事务计数
 	++commitData->stats.txnStartBatch;
-
+	//记录当前时间，用于后续统计时间差
 	state double grvStart = now();
 
+	//向其他代理请求获取提交版本
 	state vector<Future<GetReadVersionReply>> proxyVersions;
 	for (auto const& p : *otherProxies)
 		proxyVersions.push_back(brokenPromiseToNever(p.getRawCommittedVersion.getReply(
 		    GetRawCommittedVersionRequest(debugID), TaskPriority::TLogConfirmRunningReply)));
-
+	//根据系统设置和标志位，决定是否更新最后提交版本，或等待必要的恢复时间
 	if (!SERVER_KNOBS->ALWAYS_CAUSAL_READ_RISKY && !(flags & GetReadVersionRequest::FLAG_CAUSAL_READ_RISKY)) {
 		wait(updateLastCommit(commitData, debugID));
 	} else if (SERVER_KNOBS->REQUIRED_MIN_RECOVERY_DURATION > 0 &&
 	           now() - SERVER_KNOBS->REQUIRED_MIN_RECOVERY_DURATION > commitData->lastCommitTime.get()) {
 		wait(commitData->lastCommitTime.whenAtLeast(now() - SERVER_KNOBS->REQUIRED_MIN_RECOVERY_DURATION));
 	}
+
+	//记录确认epoch活跃时间
 	state double grvConfirmEpochLive = now();
 	commitData->stats.grvConfirmEpochLiveDist->sampleSeconds(grvConfirmEpochLive - grvStart);
 
+	//处理debug事件
 	if (debugID.present()) {
 		g_traceBatch.addEvent(
 		    "TransactionDebug", debugID.get().first(), "MasterProxyServer.getLiveCommittedVersion.confirmEpochLive");
 	}
 
+	//等待所有代理的回复
 	vector<GetReadVersionReply> versions = wait(getAll(proxyVersions));
 
+	//统计RPC调用时间
 	commitData->stats.grvGetCommittedVersionRpcDist->sampleSeconds(now() - grvConfirmEpochLive);
 
+	//初始化回复对象，用当前提交的数据填充
 	GetReadVersionReply rep;
 	rep.version = commitData->committedVersion.get();
 	rep.locked = commitData->locked;
 	rep.metadataVersion = commitData->metadataVersion;
 
+	//比较代理的版本，获取最大版本
 	for (auto v : versions) {
 		if (v.version > rep.version) {
 			rep = v;
 		}
 	}
+	//计算处理忙碌时间
 	rep.processBusyTime =
 	    FLOW_KNOBS->BASIC_LOAD_BALANCE_COMPUTE_PRECISION *
 	    std::min((std::numeric_limits<int>::max() / FLOW_KNOBS->BASIC_LOAD_BALANCE_COMPUTE_PRECISION) - 1,
@@ -1873,6 +1884,7 @@ ACTOR Future<GetReadVersionReply> getLiveCommittedVersion(ProxyCommitData* commi
 		    "TransactionDebug", debugID.get().first(), "MasterProxyServer.getLiveCommittedVersion.After");
 	}
 
+	//更新事务统计数据
 	commitData->stats.txnStartOut += transactionCount;
 	commitData->stats.txnSystemPriorityStartOut += systemTransactionCount;
 	commitData->stats.txnDefaultPriorityStartOut += defaultPriTransactionCount;

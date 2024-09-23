@@ -26,6 +26,7 @@
 #include "fdbclient/KeyRangeMap.h"
 #include "fdbclient/MasterProxyInterface.h"
 #include "fdbclient/SpecialKeySpace.actor.h"
+#include "fdbclient/ReadLocalCache.actor.h"
 #include "fdbrpc/QueueModel.h"
 #include "fdbrpc/MultiInterface.h"
 #include "flow/TDMetric.actor.h"
@@ -279,6 +280,10 @@ public:
 	CoalescedKeyRangeMap<Reference<LocationInfo>> locationCache;
 	std::unordered_map<Endpoint, EndpointFailureInfo> failedEndpointsOnHealthyServersInfo;
 
+	// 读数据的cache
+	LocalCache localCache;
+
+	//uid->SSinfo的映射关系
 	std::map<UID, StorageServerInfo*> server_interf;
 
 	UID dbId;

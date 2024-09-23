@@ -81,11 +81,14 @@ NetworkOptions::NetworkOptions()
 static const Key CLIENT_LATENCY_INFO_PREFIX = LiteralStringRef("client_latency/");
 static const Key CLIENT_LATENCY_INFO_CTR_PREFIX = LiteralStringRef("client_latency_counter/");
 
+//获取或更新存储服务器接口的信息
 Reference<StorageServerInfo> StorageServerInfo::getInterface(DatabaseContext* cx,
                                                              StorageServerInterface const& ssi,
                                                              LocalityData const& locality) {
+	//从DB上下文中找对应的SSI
 	auto it = cx->server_interf.find(ssi.id());
 	if (it != cx->server_interf.end()) {
+		//如果具有相同的ID的SSI的token与新接口不同，则更新接口信息
 		if (it->second->interf.getValue.getEndpoint().token != ssi.getValue.getEndpoint().token) {
 			if (it->second->interf.locality == ssi.locality) {
 				// FIXME: load balance holds pointers to individual members of the interface, and this assignment will
@@ -94,7 +97,7 @@ Reference<StorageServerInfo> StorageServerInfo::getInterface(DatabaseContext* cx
 				//       balance to take an AsyncVar<Reference<Interface>> so that it is notified when the interface
 				//       changes.
 				it->second->interf = ssi;
-			} else {
+			} else { //如果现有接口与新接口的locality不同，则销毁现有接口的上下文
 				it->second->notifyContextDestroyed();
 				Reference<StorageServerInfo> loc(new StorageServerInfo(cx, ssi, locality));
 				cx->server_interf[ssi.id()] = loc.getPtr();
@@ -104,7 +107,7 @@ Reference<StorageServerInfo> StorageServerInfo::getInterface(DatabaseContext* cx
 
 		return Reference<StorageServerInfo>::addRef(it->second);
 	}
-
+	//如果在映射表中没有找到现有接口，则创建一个新的SSInfo对象并添加到映射表
 	Reference<StorageServerInfo> loc(new StorageServerInfo(cx, ssi, locality));
 	cx->server_interf[ssi.id()] = loc.getPtr();
 	return loc;
@@ -160,6 +163,7 @@ std::string printable(const VectorRef<KeyRangeRef>& val) {
 	return s;
 }
 
+//将一个16进制字符转换为整数值
 int unhex(char c) {
 	if (c >= '0' && c <= '9')
 		return c - '0';
@@ -170,6 +174,7 @@ int unhex(char c) {
 	UNREACHABLE();
 }
 
+//将一个转义序列字符串转换为实际字符
 std::string unprintable(std::string const& val) {
 	std::string s;
 	for (int i = 0; i < val.size(); i++) {
@@ -199,6 +204,7 @@ void DatabaseContext::validateVersion(Version version) {
 	if (version == 0) {
 		throw client_invalid_operation();
 	}
+	//minAcceptableReadVersion是已接收的最大GRV，每次GRV后更新
 	if (switchable && version < minAcceptableReadVersion) {
 		TEST(true); // Attempted to read a version lower than any this client has seen from the current cluster
 		throw transaction_too_old();
@@ -214,6 +220,7 @@ void validateOptionValue(Optional<StringRef> value, bool shouldBePresent) {
 		throw invalid_option_value();
 }
 
+//打印所有的mutation操作，可以看到一共有3种mutation：set、add和clearRange
 void dumpMutations(const MutationListRef& mutations) {
 	for (auto m = mutations.begin(); m; ++m) {
 		switch (m->type) {
@@ -245,12 +252,15 @@ void delref(DatabaseContext* ptr) {
 	ptr->delref();
 }
 
+//基于ACTOR框架的协程函数，周期性地采集和记录数据库的各种性能数据
 ACTOR Future<Void> databaseLogger(DatabaseContext* cx) {
 	state double lastLogged = 0;
 	loop {
+		//系统监控的时间间隔
 		wait(delay(CLIENT_KNOBS->SYSTEM_MONITOR_INTERVAL, TaskPriority::FlushTrace));
+		//创建日志事件
 		TraceEvent ev("TransactionMetrics", cx->dbId);
-
+		//记录基本信息
 		ev.detail("Elapsed", (lastLogged == 0) ? 0 : now() - lastLogged)
 		    .detail("Cluster",
 		            cx->getConnectionFile() ? cx->getConnectionFile()->getConnectionString().clusterKeyName().toString()
@@ -258,7 +268,7 @@ ACTOR Future<Void> databaseLogger(DatabaseContext* cx) {
 		    .detail("Internal", cx->internal);
 
 		cx->cc.logToTraceEvent(ev);
-
+		//记录各种延迟和性能指标
 		ev.detail("MeanLatency", cx->latencies.mean())
 		    .detail("MedianLatency", cx->latencies.median())
 		    .detail("Latency90", cx->latencies.percentile(0.90))
@@ -280,7 +290,7 @@ ACTOR Future<Void> databaseLogger(DatabaseContext* cx) {
 		    .detail("MedianBytesPerCommit", cx->bytesPerCommit.median())
 		    .detail("MaxBytesPerCommit", cx->bytesPerCommit.max())
 		    .detail("NumLocalityCacheEntries", cx->locationCache.size());
-
+		//清空数据
 		cx->latencies.clear();
 		cx->readLatencies.clear();
 		cx->GRVLatencies.clear();
@@ -297,22 +307,29 @@ struct TrInfoChunk {
 	Key key;
 };
 
+//将一组事务chunks（每个chunk就是一个kv对）提交到fdb，并在失败时进行最多10次重试
+//从代码上看，批量提交事务的原理是将多个事务合并为一个事务提交
 ACTOR static Future<Void> transactionInfoCommitActor(Transaction* tr, std::vector<TrInfoChunk>* chunks) {
 	state const Key clientLatencyAtomicCtr = CLIENT_LATENCY_INFO_CTR_PREFIX.withPrefix(fdbClientInfoPrefixRange.begin);
 	state int retryCount = 0;
 	loop {
 		try {
+			//重置事务
 			tr->reset();
 			tr->setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 			tr->setOption(FDBTransactionOptions::LOCK_AWARE);
+			//获取版本时间戳
 			state Future<Standalone<StringRef>> vstamp = tr->getVersionstamp();
 			int64_t numCommitBytes = 0;
+			//遍历chunks中的每个事务信息块，将其原子操作添加到事务中，并计算提交的字节数
 			for (auto& chunk : *chunks) {
+				//执行操作
 				tr->atomicOp(chunk.key, chunk.value, MutationRef::SetVersionstampedKey);
 				numCommitBytes += chunk.key.size() + chunk.value.size() -
 				                  4; // subtract number of bytes of key that denotes verstion stamp index
 			}
 			tr->atomicOp(clientLatencyAtomicCtr, StringRef((uint8_t*)&numCommitBytes, 8), MutationRef::AddValue);
+			//提交事务
 			wait(tr->commit());
 			return Void();
 		} catch (Error& e) {
@@ -324,6 +341,8 @@ ACTOR static Future<Void> transactionInfoCommitActor(Transaction* tr, std::vecto
 	}
 }
 
+//删除超出client事务信息大小限制的entries
+//具体来说，就是获取当前事务大小，计算需要删除的entries范围，删除超出的部分，并更新原子计数器
 ACTOR static Future<Void> delExcessClntTxnEntriesActor(Transaction* tr, int64_t clientTxInfoSizeLimit) {
 	state const Key clientLatencyName = CLIENT_LATENCY_INFO_PREFIX.withPrefix(fdbClientInfoPrefixRange.begin);
 	state const Key clientLatencyAtomicCtr = CLIENT_LATENCY_INFO_CTR_PREFIX.withPrefix(fdbClientInfoPrefixRange.begin);
@@ -375,25 +394,36 @@ ACTOR static Future<Void> delExcessClntTxnEntriesActor(Transaction* tr, int64_t 
 // The reason for getting a pointer to DatabaseContext instead of a reference counted object is because reference
 // counting will increment reference count for DatabaseContext which holds the future of this actor. This creates a
 // cyclic reference and hence this actor and Database object will not be destroyed at all.
+// 用于更新客户端状态信息，主要负责将客户端的事务信息分成多个块，然后以事务的方式提交到DB中
+// 使用指针而不是引用，是为了避免循环引用导致的内存泄露（事务持有对DB上下文的引用）
 ACTOR static Future<Void> clientStatusUpdateActor(DatabaseContext* cx) {
+	//用于构造客户端延迟信息的key前缀
 	state const std::string clientLatencyName =
 	    CLIENT_LATENCY_INFO_PREFIX.withPrefix(fdbClientInfoPrefixRange.begin).toString();
+	//初始化事务对象，用于处理事务提交
 	state Transaction tr;
+	//存储需要提交事务块的队列（Chunk就是kv对）
 	state std::vector<TrInfoChunk> commitQ;
+	//当前事务已经使用的字节数
 	state int txBytes = 0;
 
 	loop {
 		try {
+			//确保没有尚未处理的事务信息
 			ASSERT(cx->clientStatusUpdater.outStatusQ.empty());
+			//将输入队列与输出队列交换，把要提交的事务信息转移到outStatusQ处理
 			cx->clientStatusUpdater.inStatusQ.swap(cx->clientStatusUpdater.outStatusQ);
 			// Split Transaction Info into chunks
-			state std::vector<TrInfoChunk> trChunksQ;
+			//事务信息分块处理
+			state std::vector<TrInfoChunk> trChunksQ;//临时队列，存储分割后的事务信息块
 			for (auto& entry : cx->clientStatusUpdater.outStatusQ) {
 				auto& bw = entry.second;
 				int64_t value_size_limit = BUGGIFY
 				                               ? deterministicRandom()->randomInt(1e3, CLIENT_KNOBS->VALUE_SIZE_LIMIT)
 				                               : CLIENT_KNOBS->VALUE_SIZE_LIMIT;
+				//计算事务信息需要分成多少块
 				int num_chunks = (bw.getLength() + value_size_limit - 1) / value_size_limit;
+				//为每个事务生成一个随机的唯一标识符
 				std::string random_id = deterministicRandom()->randomAlphaNumeric(16);
 				std::string user_provided_id = entry.first.size() ? entry.first + "/" : "";
 				for (int i = 0; i < num_chunks; i++) {
@@ -415,20 +445,25 @@ ACTOR static Future<Void> clientStatusUpdateActor(DatabaseContext* cx) {
 				}
 			}
 
+			// 提交事务块
 			// Commit the chunks splitting into different transactions if needed
+			//事务数据的最大大小
 			state int64_t dataSizeLimit =
 			    BUGGIFY ? deterministicRandom()->randomInt(200e3, 1.5 * CLIENT_KNOBS->TRANSACTION_SIZE_LIMIT)
 			            : 0.8 * CLIENT_KNOBS->TRANSACTION_SIZE_LIMIT;
+			//迭代器
 			state std::vector<TrInfoChunk>::iterator tracking_iter = trChunksQ.begin();
 			tr = Transaction(Database(Reference<DatabaseContext>::addRef(cx)));
 			ASSERT(commitQ.empty() && (txBytes == 0));
 			loop {
 				state std::vector<TrInfoChunk>::iterator iter = tracking_iter;
 				txBytes = 0;
+				//commitQ存储需要提交的事务块
 				commitQ.clear();
 				try {
 					while (iter != trChunksQ.end()) {
 						if (iter->value.size() + iter->key.size() + txBytes > dataSizeLimit) {
+							//提交当前事务块
 							wait(transactionInfoCommitActor(&tr, &commitQ));
 							tracking_iter = iter;
 							commitQ.clear();
@@ -456,6 +491,7 @@ ACTOR static Future<Void> clientStatusUpdateActor(DatabaseContext* cx) {
 					}
 				}
 			}
+			//清理与延迟操作
 			cx->clientStatusUpdater.outStatusQ.clear();
 			double clientSamplingProbability = std::isinf(cx->clientInfo->get().clientTxnInfoSampleRate)
 			                                       ? CLIENT_KNOBS->CSI_SAMPLING_PROBABILITY
@@ -486,12 +522,14 @@ ACTOR static Future<Void> clientStatusUpdateActor(DatabaseContext* cx) {
 	}
 }
 
+//监控主代理列表的变化，变化时触发一个事件通知系统中的其他部分
 ACTOR static Future<Void> monitorMasterProxiesChange(Reference<AsyncVar<ClientDBInfo>> clientDBInfo,
                                                      AsyncTrigger* triggerVar) {
 	state vector<MasterProxyInterface> curProxies;
 	curProxies = clientDBInfo->get().proxies;
 
 	loop {
+		//当clientDBInfo发生变化时触发
 		wait(clientDBInfo->onChange());
 		if (clientDBInfo->get().proxies != curProxies) {
 			curProxies = clientDBInfo->get().proxies;
@@ -500,7 +538,9 @@ ACTOR static Future<Void> monitorMasterProxiesChange(Reference<AsyncVar<ClientDB
 	}
 }
 
+//用于获取数据库的健康指标
 ACTOR static Future<HealthMetrics> getHealthMetricsActor(DatabaseContext* cx, bool detailed) {
+	//如果与上次健康指标更新的间隔小于阈值，直接返回缓存值
 	if (now() - cx->healthMetricsLastUpdated < CLIENT_KNOBS->AGGREGATE_HEALTH_METRICS_MAX_STALENESS) {
 		if (detailed) {
 			return cx->healthMetrics;
@@ -515,9 +555,11 @@ ACTOR static Future<HealthMetrics> getHealthMetricsActor(DatabaseContext* cx, bo
 	loop {
 		choose {
 			when(wait(cx->onMasterProxiesChanged())) {}
+			//发送获取健康指标的请求
 			when(GetHealthMetricsReply rep = wait(basicLoadBalance(cx->getMasterProxies(false),
 			                                                       &MasterProxyInterface::getHealthMetrics,
 			                                                       GetHealthMetricsRequest(sendDetailedRequest)))) {
+				//等待响应到达后更新健康指标
 				cx->healthMetrics.update(rep.healthMetrics, detailed, true);
 				if (detailed) {
 					cx->healthMetricsLastUpdated = now();
@@ -597,6 +639,7 @@ public:
 	Future<Standalone<RangeResultRef>> getRange(ReadYourWritesTransaction* ryw, KeyRangeRef kr) const override;
 };
 
+//将健康指标转换为kv对
 static Standalone<RangeResultRef> healthMetricsToKVPairs(const HealthMetrics& metrics, KeyRangeRef kr) {
 	Standalone<RangeResultRef> result;
 	if (CLIENT_BUGGIFY)
@@ -665,7 +708,7 @@ static Standalone<RangeResultRef> healthMetricsToKVPairs(const HealthMetrics& me
 	}
 	return result;
 }
-
+ 
 ACTOR static Future<Standalone<RangeResultRef>> healthMetricsGetRangeActor(ReadYourWritesTransaction* ryw,
                                                                            KeyRangeRef kr) {
 	HealthMetrics metrics = wait(ryw->getDatabase()->getHealthMetrics(
@@ -876,8 +919,9 @@ DatabaseContext::~DatabaseContext() {
 	locationCache.insert(allKeys, Reference<LocationInfo>());
 }
 
+//获取key所在的SS位置信息
 pair<KeyRange, Reference<LocationInfo>> DatabaseContext::getCachedLocation(const KeyRef& key, bool isBackward) {
-	if (isBackward) {
+	if (isBackward) { //是否从后向前查找
 		auto range = locationCache.rangeContainingKeyBefore(key);
 		return std::make_pair(range->range(), range->value());
 	} else {
@@ -886,6 +930,8 @@ pair<KeyRange, Reference<LocationInfo>> DatabaseContext::getCachedLocation(const
 	}
 }
 
+//获取key range范围内每个key所在的SS位置信息
+//检查缓存区间，确保所有位置都被缓存，然后将这些信息放入result，如果在查询过程中发现有未缓存的则返回false
 bool DatabaseContext::getCachedLocations(const KeyRangeRef& range,
                                          vector<std::pair<KeyRange, Reference<LocationInfo>>>& result,
                                          int limit,
@@ -897,12 +943,14 @@ bool DatabaseContext::getCachedLocations(const KeyRangeRef& range,
 
 	loop {
 		auto r = reverse ? end : begin;
-		if (!r->value()) {
+		if (!r->value()) { //如果当前区间没有缓存值，清空结果并返回false
 			TEST(result.size()); // had some but not all cached locations
 			result.clear();
 			return false;
 		}
+		//将当前区间和对应的位置信息加入result
 		result.emplace_back(r->range() & range, r->value());
+		//查询数量上限
 		if (result.size() == limit || begin == end) {
 			break;
 		}
@@ -916,23 +964,30 @@ bool DatabaseContext::getCachedLocations(const KeyRangeRef& range,
 	return true;
 }
 
+//将给定的key range和对应的SS位置信息存储到缓存中，必要时进行缓存清理
 Reference<LocationInfo> DatabaseContext::setCachedLocation(const KeyRangeRef& keys,
                                                            const vector<StorageServerInterface>& servers) {
 	vector<Reference<ReferencedInterface<StorageServerInterface>>> serverRefs;
+	//预留存储空间
 	serverRefs.reserve(servers.size());
+	//将每个SS接口转换为带引用的接口对象，存入serversRefs中
 	for (auto& interf : servers) {
 		serverRefs.push_back(StorageServerInfo::getInterface(this, interf, clientLocality));
 	}
-
+	//最大缓存清理尝试次数100、当前尝试次数
 	int maxEvictionAttempts = 100, attempts = 0;
 	Reference<LocationInfo> loc = Reference<LocationInfo>(new LocationInfo(serverRefs));
+	//如果缓存大小超过阈值且清理次数未达到最大值，则进行缓存清理
+	//看上去好像是随机选个一个缓存区间，使其失效
 	while (locationCache.size() > locationCacheSize && attempts < maxEvictionAttempts) {
 		TEST(true); // NativeAPI storage server locationCache entry evicted
 		attempts++;
 		auto r = locationCache.randomRange();
 		Key begin = r.begin(), end = r.end(); // insert invalidates r, so can't be passed a mere reference into it
+		//将该区间设置为无效
 		locationCache.insert(KeyRangeRef(begin, end), Reference<LocationInfo>());
 	}
+	//插入新的缓存位置
 	locationCache.insert(keys, loc);
 	return loc;
 }
@@ -986,6 +1041,7 @@ bool DatabaseContext::sampleReadTags() {
 	       deterministicRandom()->random01() <= clientInfo->get().transactionTagSampleRate;
 }
 
+//从value中提取一个64位的整数并判断有效性
 int64_t extractIntOption(Optional<StringRef> value, int64_t minValue, int64_t maxValue) {
 	validateOptionValue(value, true);
 	if (value.get().size() != 8) {
@@ -1008,6 +1064,7 @@ uint64_t extractHexOption(StringRef value) {
 	return id;
 }
 
+//根据给定的选项设置相应的数据库配置
 void DatabaseContext::setOption(FDBDatabaseOptions::Option option, Optional<StringRef> value) {
 	int defaultFor = FDBDatabaseOptions::optionInfo.getMustExist(option).defaultFor;
 	if (defaultFor >= 0) {
@@ -1132,6 +1189,7 @@ Future<Void> DatabaseContext::connectionFileChanged() {
 	return connectionFileChangedTrigger.onTrigger();
 }
 
+//清理已经过期的限流标签
 void DatabaseContext::expireThrottles() {
 	for (auto& priorityItr : throttledTags) {
 		for (auto tagItr = priorityItr.second.begin(); tagItr != priorityItr.second.end();) {
@@ -1155,6 +1213,7 @@ Database Database::createDatabase(Reference<ClusterConnectionFile> connFile,
                                   bool internal,
                                   LocalityData const& clientLocality,
                                   DatabaseContext* preallocatedDb) {
+	//检查网络
 	if (!g_network)
 		throw network_not_setup();
 
@@ -1193,9 +1252,9 @@ Database Database::createDatabase(Reference<ClusterConnectionFile> connFile,
 			uncancellable(recurring(&systemMonitor, CLIENT_KNOBS->SYSTEM_MONITOR_INTERVAL, TaskPriority::FlushTrace));
 		}
 	}
-
+	//初始化TLS
 	g_network->initTLS();
-
+	//创建异步变量和监控
 	Reference<AsyncVar<ClientDBInfo>> clientInfo(new AsyncVar<ClientDBInfo>());
 	Reference<AsyncVar<Optional<ClientLeaderRegInterface>>> coordinator(
 	    new AsyncVar<Optional<ClientLeaderRegInterface>>());
@@ -1209,6 +1268,7 @@ Database Database::createDatabase(Reference<ClusterConnectionFile> connFile,
 	                                                networkOptions.supportedVersions,
 	                                                StringRef(networkOptions.traceLogGroup));
 
+	//创建或使用预分配的DatabaseContext
 	DatabaseContext* db;
 	if (preallocatedDb) {
 		db = new (preallocatedDb) DatabaseContext(connectionFile,
@@ -1461,17 +1521,21 @@ void stopNetwork() {
 	closeTraceFile();
 }
 
+//确保DatabaseContext中的代理信息始终是最新的，并根据需要返回相应的代理信息
 Reference<ProxyInfo> DatabaseContext::getMasterProxies(bool useProvisionalProxies, bool useGrvProxies) {
+	//检查代理信息是否改变
 	if (masterProxiesLastChange != clientInfo->get().id) {
 		masterProxiesLastChange = clientInfo->get().id;
 		masterProxies.clear();
 		grvProxies.clear();
+		//更新代理信息
 		if (clientInfo->get().proxies.size()) {
 			masterProxies = Reference<ProxyInfo>(new ProxyInfo(clientInfo->get().proxies, false));
 			grvProxies = Reference<ProxyInfo>(new ProxyInfo(clientInfo->get().proxies, true));
 			provisional = clientInfo->get().proxies[0].provisional;
 		}
 	}
+	//如果使用临时代理且不允许使用临时代理，则返回空代理信息
 	if (provisional && !useProvisionalProxies) {
 		return Reference<ProxyInfo>();
 	}
@@ -1619,35 +1683,42 @@ ACTOR Future<Optional<vector<StorageServerInterface>>> transactionalGetServerInt
 
 // If isBackward == true, returns the shard containing the key before 'key' (an infinitely long, inexpressible key).
 // Otherwise returns the shard containing key
+//与主代理进行通信，获取指定key的位置信息
 ACTOR Future<pair<KeyRange, Reference<LocationInfo>>> getKeyLocation_internal(Database cx,
                                                                               Key key,
                                                                               TransactionInfo info,
                                                                               bool isBackward = false) {
+	//参数验证，保证key的范围合法
 	if (isBackward) {
 		ASSERT(key != allKeys.begin && key <= allKeys.end);
 	} else {
 		ASSERT(key < allKeys.end);
 	}
-
+	//记录debug事件
 	if (info.debugID.present())
 		g_traceBatch.addEvent("TransactionDebug", info.debugID.get().first(), "NativeAPI.getKeyLocation.Before");
 
 	loop {
+		//请求计数器+1
 		++cx->transactionKeyServerLocationRequests;
 		choose {
+			//如果主代理发生变化，则等待
 			when(wait(cx->onMasterProxiesChanged())) {}
+			//发送获取key所属的SS位置的请求，并等待
 			when(GetKeyServerLocationsReply rep = wait(basicLoadBalance(
 			         cx->getMasterProxies(info.useProvisionalProxies),
 			         &MasterProxyInterface::getKeyServersLocations,
 			         GetKeyServerLocationsRequest(key, Optional<KeyRef>(), 100, isBackward, key.arena()),
 			         TaskPriority::DefaultPromiseEndpoint))) {
+				//请求完成，计数器++
 				++cx->transactionKeyServerLocationRequestsCompleted;
 				if (info.debugID.present())
 					g_traceBatch.addEvent(
 					    "TransactionDebug", info.debugID.get().first(), "NativeAPI.getKeyLocation.After");
 				ASSERT(rep.results.size() == 1);
-
+				//缓存获取的位置信息
 				auto locationInfo = cx->setCachedLocation(rep.results[0].first, rep.results[0].second);
+				//返回key range和位置信息的pari对象
 				return std::make_pair(KeyRange(rep.results[0].first, rep.arena), locationInfo);
 			}
 		}
@@ -1682,31 +1753,33 @@ bool checkOnlyEndpointFailed(const Database& cx, const Endpoint& endpoint) {
 	}
 	return false;
 }
-
+//获取指定key的SS位置信息
 template <class F>
 Future<pair<KeyRange, Reference<LocationInfo>>> getKeyLocation(Database const& cx,
                                                                Key const& key,
                                                                F StorageServerInterface::*member,
                                                                TransactionInfo const& info,
                                                                bool isBackward = false) {
+	//先尝试从缓存中获取，如果缓存中没有，则调用internal函数向主代理请求
 	auto ssi = cx->getCachedLocation(key, isBackward);
 	if (!ssi.second) {
 		return getKeyLocation_internal(cx, key, info, isBackward);
 	}
-
+	//检查缓存是否有效
 	bool onlyEndpointFailedAndNeedRefresh = false;
+	//ssi.second表示SS接口的数量，检查这些接口的端点是否失效
 	for (int i = 0; i < ssi.second->size(); i++) {
 		if (checkOnlyEndpointFailed(cx, ssi.second->get(i, member).getEndpoint())) {
 			onlyEndpointFailedAndNeedRefresh = true;
 		}
 	}
-
+	//如果仅仅是端点失效，则重新获取位置信息
 	if (onlyEndpointFailedAndNeedRefresh) {
 		cx->invalidateCache(key);
 		// Refresh the cache with a new getKeyLocations made to proxies.
 		return getKeyLocation_internal(cx, key, info, isBackward);
 	}
-
+	//返回缓存的位置信息
 	return ssi;
 }
 
@@ -1756,6 +1829,7 @@ ACTOR Future<vector<pair<KeyRange, Reference<LocationInfo>>>> getKeyRangeLocatio
 // ShardRange is the whole shard key-range, not a part of the given key range.
 // Example: If query the function with  key range (b, d), the returned list of pairs could be something like:
 // [([a, b1), locationInfo), ([b1, c), locationInfo), ([c, d1), locationInfo)].
+//获取指定key range的SS位置，注意，返回的结果中的key-range是整个shard的key-range
 template <class F>
 Future<vector<pair<KeyRange, Reference<LocationInfo>>>> getKeyRangeLocations(Database const& cx,
                                                                              KeyRange const& keys,
@@ -1836,16 +1910,22 @@ ACTOR Future<Optional<Value>> getValue(Future<Version> version,
                                        TransactionInfo info,
                                        Reference<TransactionLogInfo> trLogInfo,
                                        TagSet tags) {
+		
+	//验证版本
 	state Version ver = wait(version);
 	cx->validateVersion(ver);
 
 	loop {
+		//获取key所在的ss存储服务器位置信息
 		state pair<KeyRange, Reference<LocationInfo>> ssi =
 		    wait(getKeyLocation(cx, key, &StorageServerInterface::getValue, info));
+		//唯一标识本次get操作的id
 		state Optional<UID> getValueID = Optional<UID>();
+		//用于测量操作延迟的时间戳
 		state uint64_t startTime;
 		state double startTimeD;
 		try {
+			//处理debug选项
 			if (info.debugID.present()) {
 				getValueID = nondeterministicRandom()->randomUniqueID();
 
@@ -1858,18 +1938,19 @@ ACTOR Future<Optional<Value>> getValue(Future<Version> version,
 				    .detail("ReqVersion", ver)
 				    .detail("Servers", describe(ssi.second->get()));*/
 			}
-
+			//更新一些计数器
 			++cx->getValueSubmitted;
 			startTime = timer_int();
 			startTimeD = now();
 			++cx->transactionPhysicalReads;
-
+			//初始化get的reply
 			state GetValueReply reply;
 			try {
 				if (CLIENT_BUGGIFY_WITH_PROB(.01)) {
 					throw deterministicRandom()->randomChoice(
 					    std::vector<Error>{ transaction_too_old(), future_version() });
 				}
+				//通过loadBalance函数在多个SS间负载均衡，以获取数据
 				choose {
 					when(wait(cx->connectionFileChanged())) { throw transaction_too_old(); }
 					when(GetValueReply _reply = wait(loadBalance(
@@ -1887,7 +1968,7 @@ ACTOR Future<Optional<Value>> getValue(Future<Version> version,
 				++cx->transactionPhysicalReadsCompleted;
 				throw;
 			}
-
+			//记录获取数据的延迟
 			double latency = now() - startTimeD;
 			cx->readLatencies.addSample(latency);
 			if (trLogInfo) {
@@ -1898,6 +1979,7 @@ ACTOR Future<Optional<Value>> getValue(Future<Version> version,
 			cx->getValueCompleted->latency = timer_int() - startTime;
 			cx->getValueCompleted->log();
 
+			//记录debug信息
 			if (info.debugID.present()) {
 				g_traceBatch.addEvent("GetValueDebug",
 				                      getValueID.get().first(),
@@ -1907,9 +1989,10 @@ ACTOR Future<Optional<Value>> getValue(Future<Version> version,
 				    .detail("ReqVersion", ver)
 				    .detail("ReplySize", reply.value.present() ? reply.value.get().size() : -1);*/
 			}
-
+			//更新事务的读取字节数和读取key数
 			cx->transactionBytesRead += reply.value.present() ? reply.value.get().size() : 0;
 			++cx->transactionKeysRead;
+			//返回get读取到的值
 			return reply.value;
 		} catch (Error& e) {
 			cx->getValueCompleted->latency = timer_int() - startTime;
@@ -1937,9 +2020,11 @@ ACTOR Future<Optional<Value>> getValue(Future<Version> version,
 	}
 }
 
+//获取keySelector对应的键
 ACTOR Future<Key> getKey(Database cx, KeySelector k, Future<Version> version, TransactionInfo info, TagSet tags) {
+	//等待事务版本
 	wait(success(version));
-
+	//设置debug信息
 	state Optional<UID> getKeyID = Optional<UID>();
 	if (info.debugID.present()) {
 		getKeyID = nondeterministicRandom()->randomUniqueID();
@@ -1960,11 +2045,11 @@ ACTOR Future<Key> getKey(Database cx, KeySelector k, Future<Version> version, Tr
 		} else if (k.getKey() == allKeys.begin && k.offset <= 0) {
 			return Key();
 		}
-
+		//获取包含k的分片信息LocationInfo ssi
 		Key locationKey(k.getKey(), k.arena());
 		state pair<KeyRange, Reference<LocationInfo>> ssi =
 		    wait(getKeyLocation(cx, locationKey, &StorageServerInterface::getKey, info, k.isBackward()));
-
+		//尝试从SS获取key
 		try {
 			if (info.debugID.present())
 				g_traceBatch.addEvent(
@@ -2017,6 +2102,7 @@ ACTOR Future<Key> getKey(Database cx, KeySelector k, Future<Version> version, Tr
 	}
 }
 
+//等待数据库的版本号达到或超过指定版本号，不断从masterProxy获取当前一致的读版本并进行检查
 ACTOR Future<Version> waitForCommittedVersion(Database cx, Version version) {
 	try {
 		loop {
@@ -2043,6 +2129,7 @@ ACTOR Future<Version> waitForCommittedVersion(Database cx, Version version) {
 	}
 }
 
+//直接从masterProxy获取一个一致的读版本，不做任何check
 ACTOR Future<Version> getRawVersion(Database cx) {
 	loop {
 		choose {
@@ -2062,22 +2149,27 @@ ACTOR Future<Void> readVersionBatcher(
     FutureStream<std::pair<Promise<GetReadVersionReply>, Optional<UID>>> versionStream,
     uint32_t flags);
 
+//监视某个特定的kv对，如果该key的value发生变化，返回一个Future<Void>对象
 ACTOR Future<Void> watchValue(Future<Version> version,
                               Key key,
                               Optional<Value> value,
                               Database cx,
                               TransactionInfo info,
                               TagSet tags) {
+	//等待指定的版本号，并验证该版本号的有效性
 	state Version ver = wait(version);
 	cx->validateVersion(ver);
 	ASSERT(ver != latestVersion);
 
 	loop {
+		//获取key的存储位置SSI
 		state pair<KeyRange, Reference<LocationInfo>> ssi =
 		    wait(getKeyLocation(cx, key, &StorageServerInterface::watchValue, info));
 
 		try {
+			//生成一个watchID
 			state Optional<UID> watchValueID = Optional<UID>();
+			//debug信息
 			if (info.debugID.present()) {
 				watchValueID = nondeterministicRandom()->randomUniqueID();
 
@@ -2086,8 +2178,10 @@ ACTOR Future<Void> watchValue(Future<Version> version,
 				                      watchValueID.get().first(),
 				                      "NativeAPI.watchValue.Before"); //.detail("TaskID", g_network->getCurrentTask());
 			}
+			//创建watchValue请求
 			state WatchValueReply resp;
 			choose {
+				//发送watchValue请求
 				when(WatchValueReply r = wait(loadBalance(
 				         ssi.second,
 				         &StorageServerInterface::watchValue,
@@ -2107,16 +2201,18 @@ ACTOR Future<Void> watchValue(Future<Version> version,
 			// FIXME: wait for known committed version on the storage server before replying,
 			// cannot do this until the storage server is notified on knownCommittedVersion changes from tlog (faster
 			// than the current update loop)
+			//等待确认的版本号
 			Version v = wait(waitForCommittedVersion(cx, resp.version));
 
 			//TraceEvent("WatcherCommitted").detail("CommittedVersion", v).detail("WatchVersion", resp.version).detail("Key",  key ).detail("Value", value);
 
 			// False if there is a master failure between getting the response and getting the committed version,
 			// Dependent on SERVER_KNOBS->MAX_VERSIONS_IN_FLIGHT
+			//如果确认的版本号和响应的版本号差距不大，返回void表示监视完成
 			if (v - resp.version < 50000000)
 				return Void();
 			ver = v;
-		} catch (Error& e) {
+		} catch (Error& e) { //处理各种错误情况，根据错误类型进行适当的处理和重试
 			if (e.code() == error_code_wrong_shard_server || e.code() == error_code_all_alternatives_failed) {
 				cx->invalidateCache(key);
 				wait(delay(CLIENT_KNOBS->WRONG_SHARD_SERVER_DELAY, info.taskID));
@@ -2812,23 +2908,27 @@ void Transaction::setVersion(Version v) {
 }
 
 Future<Optional<Value>> Transaction::get(const Key& key, bool snapshot) {
+	//增加事务的逻辑请求计数和getValue请求计数
 	++cx->transactionLogicalReads;
 	++cx->transactionGetValueRequests;
 	// ASSERT (key < allKeys.end);
 
 	// There are no keys in the database with size greater than KEY_SIZE_LIMIT
+	//检查key的大小是否超过了最大允许的key大小
 	if (key.size() >
 	    (key.startsWith(systemKeys.begin) ? CLIENT_KNOBS->SYSTEM_KEY_SIZE_LIMIT : CLIENT_KNOBS->KEY_SIZE_LIMIT))
 		return Optional<Value>();
 
+	//获取读时间戳
 	auto ver = getReadVersion();
 
 	/*	if (!systemKeys.contains(key))
 	        return Optional<Value>(Value()); */
-
+	//如果不是快照读，将要读取的key添加到冲突检测范围中，这是为了在事务提交时检测读写冲突
 	if (!snapshot)
 		tr.transaction.read_conflict_ranges.push_back(tr.arena, singleKeyRange(key, tr.arena));
 
+	//处理get元数据版本key的特殊情况
 	if (key == metadataVersionKey) {
 		++cx->transactionMetadataVersionReads;
 		if (!ver.isReady() || metadataVersion.isSet()) {
@@ -2861,7 +2961,7 @@ Future<Optional<Value>> Transaction::get(const Key& key, bool snapshot) {
 			}
 		}
 	}
-
+	//进一步调用getValue获取value
 	return getValue(ver, key, cx, info, trLogInfo, options.readTags);
 }
 
@@ -3084,6 +3184,8 @@ void Transaction::addReadConflictRange(KeyRangeRef const& keys) {
 	tr.transaction.read_conflict_ranges.push_back_deep(tr.arena, r);
 }
 
+//手动将当前事务标记为自冲突，确保在提交时触发冲突检测并强制回滚
+//生成一个随机key添加到读冲突范围和写冲突范围
 void Transaction::makeSelfConflicting() {
 	BinaryWriter wr(Unversioned());
 	wr.serializeBytes(LiteralStringRef("\xFF/SC/"));
@@ -3094,35 +3196,40 @@ void Transaction::makeSelfConflicting() {
 }
 
 void Transaction::set(const KeyRef& key, const ValueRef& value, bool addConflictRange) {
+	//增加set操作计数
 	++cx->transactionSetMutations;
+	//检查key和value大小
 	if (key.size() >
 	    (key.startsWith(systemKeys.begin) ? CLIENT_KNOBS->SYSTEM_KEY_SIZE_LIMIT : CLIENT_KNOBS->KEY_SIZE_LIMIT))
 		throw key_too_large();
 	if (value.size() > CLIENT_KNOBS->VALUE_SIZE_LIMIT)
 		throw value_too_large();
-
+	//构造一个mutation记录，其中：req引用当前事务请求对象，t是当前事务对象
 	auto& req = tr;
 	auto& t = req.transaction;
 	auto r = singleKeyRange(key, req.arena);
 	auto v = ValueRef(req.arena, value);
 	t.mutations.push_back(req.arena, MutationRef(MutationRef::SetValue, r.begin, v));
-
+	//如果需要，添加冲突范围，在事务提交时进行冲突检测
 	if (addConflictRange) {
 		t.write_conflict_ranges.push_back(req.arena, r);
 	}
 }
 
+//执行原子操作
 void Transaction::atomicOp(const KeyRef& key,
                            const ValueRef& operand,
-                           MutationRef::Type operationType,
+                           MutationRef::Type operationType, //操作类型
                            bool addConflictRange) {
-	++cx->transactionAtomicMutations;
+	++cx->transactionAtomicMutations; //事务原子操作计数
+	//检查key和value的大小限制
 	if (key.size() >
 	    (key.startsWith(systemKeys.begin) ? CLIENT_KNOBS->SYSTEM_KEY_SIZE_LIMIT : CLIENT_KNOBS->KEY_SIZE_LIMIT))
 		throw key_too_large();
 	if (operand.size() > CLIENT_KNOBS->VALUE_SIZE_LIMIT)
 		throw value_too_large();
 
+	//处理操作类型的版本兼容性
 	if (apiVersionAtLeast(510)) {
 		if (operationType == MutationRef::Min)
 			operationType = MutationRef::MinV2;
@@ -3130,13 +3237,16 @@ void Transaction::atomicOp(const KeyRef& key,
 			operationType = MutationRef::AndV2;
 	}
 
+	//记录变更操作
 	auto& req = tr;
 	auto& t = req.transaction;
+	//创建一个单键范围，key转换为keyrange
 	auto r = singleKeyRange(key, req.arena);
 	auto v = ValueRef(req.arena, operand);
-
+	//将该原子操作以MutationRef的形式添加到当前事务的mutations列表中
 	t.mutations.push_back(req.arena, MutationRef(operationType, r.begin, v));
 
+	//处理写冲突范围，用于在事务提交时检测是否存在写冲突
 	if (addConflictRange && operationType != MutationRef::SetVersionstampedKey)
 		t.write_conflict_ranges.push_back(req.arena, r);
 
@@ -3491,38 +3601,43 @@ void Transaction::setupWatches() {
 	}
 }
 
+//提交事务
 ACTOR static Future<Void> tryCommit(Database cx,
                                     Reference<TransactionLogInfo> trLogInfo,
-                                    CommitTransactionRequest req,
-                                    Future<Version> readVersion,
-                                    TransactionInfo info,
-                                    Version* pCommittedVersion,
+                                    CommitTransactionRequest req,//事务请求
+                                    Future<Version> readVersion,//事务的读取版本
+                                    TransactionInfo info,//事务的元数据信息
+                                    Version* pCommittedVersion,//提交版本号
                                     Transaction* tr,
                                     TransactionOptions options) {
+	//跟踪事务提交的过程
 	state TraceInterval interval("TransactionCommit");
 	state double startTime = now();
 	if (info.debugID.present())
 		TraceEvent(interval.begin()).detail("Parent", info.debugID.get());
 	try {
+		//模拟故障，BUGGIFY是fdb的一种故障注入机制，随机模拟事务提交中的常见错误
 		if (CLIENT_BUGGIFY) {
 			throw deterministicRandom()->randomChoice(std::vector<Error>{
 			    not_committed(), transaction_too_old(), proxy_memory_limit_exceeded(), commit_unknown_result() });
 		}
-
+		//获取读版本,等待异步结果readVersion
 		Version v = wait(readVersion);
 		req.transaction.read_snapshot = v;
 
 		startTime = now();
+		//生成唯一的提交标识符
 		state Optional<UID> commitID = Optional<UID>();
 		if (info.debugID.present()) {
 			commitID = nondeterministicRandom()->randomUniqueID();
 			g_traceBatch.addAttach("CommitAttachID", info.debugID.get().first(), commitID.get().first());
 			g_traceBatch.addEvent("CommitDebug", commitID.get().first(), "NativeAPI.commit.Before");
 		}
-
 		req.debugID = commitID;
+
+		//选择提交代理！这里是重点！！！
 		state Future<CommitID> reply;
-		if (options.commitOnFirstProxy) {
+		if (options.commitOnFirstProxy) { //提交到第一个代理
 			if (cx->clientInfo->get().firstProxy.present()) {
 				reply = throwErrorOr(
 				    brokenPromiseToMaybeDelivered(cx->clientInfo->get().firstProxy.get().commit.tryGetReply(req)));
@@ -3531,7 +3646,7 @@ ACTOR static Future<Void> tryCommit(Database cx,
 				reply = proxies.size() ? throwErrorOr(brokenPromiseToMaybeDelivered(proxies[0].commit.tryGetReply(req)))
 				                       : Never();
 			}
-		} else {
+		} else { //负载均衡选择某个代理
 			reply = basicLoadBalance(cx->getMasterProxies(info.useProvisionalProxies),
 			                         &MasterProxyInterface::commit,
 			                         req,
@@ -3539,20 +3654,26 @@ ACTOR static Future<Void> tryCommit(Database cx,
 			                         true);
 		}
 
+		//提交事务并处理响应
 		choose {
 			when(wait(cx->onMasterProxiesChanged())) {
 				reply.cancel();
 				throw request_maybe_delivered();
 			}
+			//等待提交事务的reply
 			when(CommitID ci = wait(reply)) {
 				Version v = ci.version;
+				//提交成功
 				if (v != invalidVersion) {
-					if (CLIENT_BUGGIFY) {
+					if (CLIENT_BUGGIFY) { //故障注入
 						throw commit_unknown_result();
 					}
 					if (info.debugID.present())
 						TraceEvent(interval.end()).detail("CommittedVersion", v);
+					//提交版本号
 					*pCommittedVersion = v;
+					//记录提交版本，更新元数据缓存，并处理提交后的事务信息
+
 					if (v > cx->metadataVersionCache[cx->mvCacheInsertLocation].first) {
 						cx->mvCacheInsertLocation = (cx->mvCacheInsertLocation + 1) % cx->metadataVersionCache.size();
 						cx->metadataVersionCache[cx->mvCacheInsertLocation] = std::make_pair(v, ci.metadataVersion);
@@ -3582,7 +3703,8 @@ ACTOR static Future<Void> tryCommit(Database cx,
 						                                                     ci.version,
 						                                                     req));
 					return Void();
-				} else {
+				} else { //提交失败，处理事务冲突
+
 					// clear the RYW transaction which contains previous conflicting keys
 					tr->info.conflictingKeys.reset();
 					if (ci.conflictingKRIndices.present()) {
@@ -3650,9 +3772,11 @@ ACTOR static Future<Void> tryCommit(Database cx,
 	}
 }
 
+//提交事务的mutations
 Future<Void> Transaction::commitMutations() {
 	try {
 		// if this is a read-only transaction return immediately
+		//如果是只读事务，直接返回，不需要提交
 		if (!tr.transaction.write_conflict_ranges.size() && !tr.transaction.mutations.size()) {
 			numErrors = 0;
 
@@ -3660,15 +3784,15 @@ Future<Void> Transaction::commitMutations() {
 			versionstampPromise.sendError(no_commit_version());
 			return Void();
 		}
-
+		//计数器
 		++cx->transactionsCommitStarted;
-
+		//检查只读选项，如果是只读事务，返回一个ERROR（只读事务不需要提交，在上面就会返回）
 		if (options.readOnly)
 			return transaction_read_only();
-
+		//收集事务统计数据
 		cx->mutationsPerCommit.addSample(tr.transaction.mutations.size());
 		cx->bytesPerCommit.addSample(tr.transaction.mutations.expectedSize());
-
+		//检查事务大小，如果大于预定义的警告阈值，则记录一个事件
 		size_t transactionSize = getSize();
 		if (transactionSize > (uint64_t)FLOW_KNOBS->PACKET_WARNING) {
 			TraceEvent(!g_network->isSimulated() ? SevWarnAlways : SevWarn, "LargeTransaction")
@@ -3685,33 +3809,37 @@ Future<Void> Transaction::commitMutations() {
 			    tr.transaction.mutations.expectedSize(); // Old API versions didn't account for conflict ranges when
 			                                             // determining whether to throw transaction_too_large
 		}
-
+		//如果事务大小超过范围，返回transaction_too_large错误
 		if (transactionSize > options.sizeLimit) {
 			return transaction_too_large();
 		}
-
+		//如果是盲写事务（没有读操作），在这里会获取一个读版本
 		if (!readVersion.isValid())
 			getReadVersion(
 			    GetReadVersionRequest::FLAG_CAUSAL_READ_RISKY); // sets up readVersion field.  We had no reads, so no
 			                                                    // need for (expensive) full causal consistency.
-
+		//1%概率启用写检查
 		bool isCheckingWrites = options.checkWritesEnabled && deterministicRandom()->random01() < 0.01;
+		//处理额外的冲突范围（某些情况下事务会有额外的读写冲突范围需要处理）
 		for (int i = 0; i < extraConflictRanges.size(); i++)
 			if (extraConflictRanges[i].isReady() &&
 			    extraConflictRanges[i].get().first < extraConflictRanges[i].get().second)
 				tr.transaction.read_conflict_ranges.push_back(
 				    tr.arena, KeyRangeRef(extraConflictRanges[i].get().first, extraConflictRanges[i].get().second));
-
+		//检查事务的写冲突范围和读冲突范围是否有交集
 		if (!options.causalWriteRisky &&
 		    !intersects(tr.transaction.write_conflict_ranges, tr.transaction.read_conflict_ranges).present())
+			//标记自冲突
 			makeSelfConflicting();
 
+		//1%的概率进行写检查，将所有写冲突范围添加到读冲突范围中
 		if (isCheckingWrites) {
 			// add all writes into the read conflict range...
 			tr.transaction.read_conflict_ranges.append(
 			    tr.arena, tr.transaction.write_conflict_ranges.begin(), tr.transaction.write_conflict_ranges.size());
 		}
 
+		//debug信息
 		if (options.debugDump) {
 			UID u = nondeterministicRandom()->randomUniqueID();
 			TraceEvent("TransactionDump", u);
@@ -3721,7 +3849,7 @@ Future<Void> Transaction::commitMutations() {
 				    .detail("P1", i->param1)
 				    .detail("P2", i->param2);
 		}
-
+		//设置事务标志
 		if (options.lockAware) {
 			tr.flags = tr.flags | CommitTransactionRequest::FLAG_IS_LOCK_AWARE;
 		}
@@ -3731,12 +3859,13 @@ Future<Void> Transaction::commitMutations() {
 		if (options.reportConflictingKeys) {
 			tr.transaction.report_conflicting_keys = true;
 		}
-
+		//尝试提交事务，返回一个表示提交结果的Future<Void>
 		Future<Void> commitResult =
 		    tryCommit(cx, trLogInfo, tr, readVersion, info, &this->committedVersion, this, options);
 
 		if (isCheckingWrites) {
 			Promise<Void> committed;
+			//检查写入冲突
 			checkWrites(cx, commitResult, committed, tr, this);
 			return committed.getFuture();
 		}
@@ -3751,14 +3880,16 @@ Future<Void> Transaction::commitMutations() {
 	}
 }
 
+//Future<Void>表示这是一个异步操作
 ACTOR Future<Void> commitAndWatch(Transaction* self) {
 	try {
+		//事务提交的核心是提交事务的修改操作
 		wait(self->commitMutations());
 
 		if (!self->watches.empty()) {
 			self->setupWatches();
 		}
-
+		//重置事务
 		self->reset();
 		return Void();
 	} catch (Error& e) {
@@ -3775,6 +3906,7 @@ ACTOR Future<Void> commitAndWatch(Transaction* self) {
 	}
 }
 
+//提交事务
 Future<Void> Transaction::commit() {
 	ASSERT(!committing.isValid());
 	committing = commitAndWatch(this);
@@ -3966,14 +4098,18 @@ ACTOR Future<GetReadVersionReply> getConsistentReadVersion(DatabaseContext* cx,
 		g_traceBatch.addEvent("TransactionDebug", debugID.get().first(), "NativeAPI.getConsistentReadVersion.Before");
 	loop {
 		try {
+			//创建请求对象，包含了请求的详细信息
 			state GetReadVersionRequest req(transactionCount, priority, flags, tags, debugID);
 			choose {
+				//如果masterProxy更改，则等待
 				when(wait(cx->onMasterProxiesChanged())) {}
+				//通过负载均衡，向masterProxy发送请求，等待返回一致的读版本
 				when(GetReadVersionReply v = wait(basicLoadBalance(
 				         cx->getMasterProxies(flags & GetReadVersionRequest::FLAG_USE_PROVISIONAL_PROXIES, true),
 				         &MasterProxyInterface::getConsistentReadVersion,
 				         req,
 				         cx->taskID))) {
+					//处理tags信息
 					if (tags.size() != 0) {
 						auto& priorityThrottledTags = cx->throttledTags[priority];
 						for (auto& tag : tags) {
@@ -3990,7 +4126,7 @@ ACTOR Future<GetReadVersionReply> getConsistentReadVersion(DatabaseContext* cx,
 							}
 						}
 					}
-
+					//记录debug信息
 					if (debugID.present())
 						g_traceBatch.addEvent(
 						    "TransactionDebug", debugID.get().first(), "NativeAPI.getConsistentReadVersion.After");
@@ -4015,18 +4151,24 @@ ACTOR Future<Void> readVersionBatcher(DatabaseContext* cx,
                                       FutureStream<DatabaseContext::VersionRequest> versionStream,
                                       TransactionPriority priority,
                                       uint32_t flags) {
+	//当前批处理中的所有版本请求
 	state std::vector<Promise<GetReadVersionReply>> requests;
+	//管理actor集合
 	state PromiseStream<Future<Void>> addActor;
+	//收集actor状态，处理错误
 	state Future<Void> collection = actorCollection(addActor.getFuture());
 	state Future<Void> timeout;
 	state Optional<UID> debugID;
+	//是否发送批处理的标记
 	state bool send_batch;
+	//批处理大小、间隔和GRV响应的直方图，用于收集统计数据
 	state Reference<Histogram> batchSizeDist = Histogram::getHistogram(
 	    LiteralStringRef("GrvBatcher"), LiteralStringRef("ClientGrvBatchSize"), Histogram::Unit::microseconds);
 	state Reference<Histogram> batchIntervalDist = Histogram::getHistogram(
 	    LiteralStringRef("GrvBatcher"), LiteralStringRef("ClientGrvBatchInterval"), Histogram::Unit::microseconds);
 	state Reference<Histogram> grvReplyLatencyDist = Histogram::getHistogram(
 	    LiteralStringRef("GrvBatcher"), LiteralStringRef("ClientGrvReplyLatency"), Histogram::Unit::microseconds);
+	//上一次请求的时间
 	state double lastRequestTime = now();
 
 	state TransactionTagMap<uint32_t> tags;
@@ -4034,47 +4176,57 @@ ACTOR Future<Void> readVersionBatcher(DatabaseContext* cx,
 	// dynamic batching
 	state PromiseStream<double> replyTimes;
 	state PromiseStream<Error> _errorStream;
+	//动态调整的批处理时间
 	state double batchTime = 0;
 	loop {
 		send_batch = false;
 		choose {
+			//等待下一个版本请求
 			when(DatabaseContext::VersionRequest req = waitNext(versionStream)) {
+				//debug信息
 				if (req.debugID.present()) {
 					if (!debugID.present()) {
 						debugID = nondeterministicRandom()->randomUniqueID();
 					}
 					g_traceBatch.addAttach("TransactionAttachID", req.debugID.get().first(), debugID.get().first());
 				}
+				//将新的请求添加到requests
 				requests.push_back(req.reply);
+				//更新请求的标签
 				for (auto tag : req.tags) {
 					++tags[tag];
 				}
-
+				//如果requests大小达到最大批处理大小，则标记发送批处理
 				if (requests.size() == CLIENT_KNOBS->MAX_BATCH_SIZE) {
 					send_batch = true;
 					++cx->transactionGrvFullBatches;
-				} else if (!timeout.isValid()) {
+				} else if (!timeout.isValid()) { //如果没有设置超时，则设置超时
 					timeout = delay(batchTime, TaskPriority::GetConsistentReadVersion);
 				}
 			}
+			//等待超时，超时后标记发送批处理
 			when(wait(timeout.isValid() ? timeout : Never())) {
 				send_batch = true;
 				++cx->transactionGrvTimedOutBatches;
 			}
 			// dynamic batching monitors reply latencies
+			//动态批处理监控回复延迟
 			when(double reply_latency = waitNext(replyTimes.getFuture())) {
 				double target_latency = reply_latency * 0.5;
 				batchTime = min(0.1 * target_latency + 0.9 * batchTime, CLIENT_KNOBS->GRV_BATCH_TIMEOUT);
 				grvReplyLatencyDist->sampleSeconds(reply_latency);
 			}
+			//收集actor状态
 			when(wait(collection)) {} // for errors
 		}
+		//发送批处理版本请求的逻辑
 		if (send_batch) {
 			int count = requests.size();
 			ASSERT(count);
 
-			batchSizeDist->sample(count);
+			batchSizeDist->sample(count); //将批处理请求的大小记录到直方图
 			auto requestTime = now();
+			//记录批处理的时间间隔
 			batchIntervalDist->sampleSeconds(requestTime - lastRequestTime);
 			lastRequestTime = requestTime;
 
@@ -4083,6 +4235,7 @@ ACTOR Future<Void> readVersionBatcher(DatabaseContext* cx,
 			requests.push_back(GRVReply);
 			addActor.send(ready(timeReply(GRVReply.getFuture(), replyTimes)));
 
+			//广播请求
 			Future<Void> batch = incrementalBroadcastWithError(
 			    getConsistentReadVersion(cx, count, priority, flags, std::move(tags), std::move(debugID)),
 			    std::move(requests),
@@ -4164,10 +4317,12 @@ ACTOR Future<Version> extractReadVersion(DatabaseContext* cx,
 	return rep.version;
 }
 
+//获取读时间戳,第一次调用该函数时会去获取读版本，之后直接返回
 Future<Version> Transaction::getReadVersion(uint32_t flags) {
 	if (!readVersion.isValid()) {
 		++cx->transactionReadVersions;
 		flags |= options.getReadVersionFlags;
+		//这里事务的优先级指的是FDB每次处理多少个事务
 		switch (options.priority) {
 		case TransactionPriority::IMMEDIATE:
 			flags |= GetReadVersionRequest::PRIORITY_SYSTEM_IMMEDIATE;
@@ -4184,7 +4339,7 @@ Future<Version> Transaction::getReadVersion(uint32_t flags) {
 		default:
 			ASSERT(false);
 		}
-
+		//如果有tags，则检查是否需要限流
 		if (options.tags.size() != 0) {
 			double maxThrottleDelay = 0.0;
 			bool canRecheck = false;
@@ -4218,12 +4373,12 @@ Future<Version> Transaction::getReadVersion(uint32_t flags) {
 				}
 			}
 		}
-
+		//获取读版本的批处理器，用于批处理读版本请求
 		auto& batcher = cx->versionBatcher[flags];
 		if (!batcher.actor.isValid()) {
 			batcher.actor = readVersionBatcher(cx.getPtr(), batcher.stream.getFuture(), options.priority, flags);
 		}
-
+		//构造读版本请求，等待结果返回
 		auto const req = DatabaseContext::VersionRequest(options.tags, info.debugID);
 		batcher.stream.send(req);
 		startTime = now();

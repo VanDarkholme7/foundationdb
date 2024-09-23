@@ -330,12 +330,14 @@ private:
 	// views
 	//   at older versions may contain older items which are also in storage (this is OK because of idempotency)
 
+	//SS中真正存放数据的地方，似乎存储了不同版本的键值对
 	VersionedData versionedData;
+	//存储了从durableVersion到当前版本的变更日志
 	std::map<Version, Standalone<VerUpdateRef>> mutationLog; // versions (durableVersion, version]
 
 public:
 public:
-	// Histograms
+	// Histograms 直方图，用于记录各种操作的延迟、带宽等统计信息，便于性能检测和分析
 	struct FetchKeysHistograms {
 		const Reference<Histogram> latency;
 		const Reference<Histogram> bytes;
@@ -362,6 +364,7 @@ public:
 	Reference<Histogram> storageCommitLatencyHistogram;
 	Reference<Histogram> ssDurableVersionUpdateLatencyHistogram;
 
+	//用于管理和跟踪当前正在运行的kv获取操作
 	class CurrentRunningFetchKeys {
 		std::unordered_map<UID, double> startTimeMap;
 		std::unordered_map<UID, KeyRange> keyRangeMap;
@@ -408,10 +411,12 @@ public:
 		int numRunning() const { return startTimeMap.size(); }
 	} currentRunningFetchKeys;
 
+	//管理和跟踪日志系统的历史版本和操作
 	Tag tag;
 	vector<std::pair<Version, Tag>> history;
 	vector<std::pair<Version, Tag>> allHistory;
 	Version poppedAllAfter;
+	//管理内存、存储和资源使用情况
 	std::map<Version, Arena>
 	    freeable; // for each version, an Arena that must be held until that version is < oldestVersion
 	Arena lastArena;
@@ -514,11 +519,12 @@ public:
 	// newestAvailableVersion[k]
 	//   == invalidVersion -> k is unavailable at all versions
 	//   <= storageVersion -> k is unavailable at all versions (but might be read anyway from storage if we are in the
-	//   process of committing makeShardDurable)
+	//   process of committing makeShardDurable) 可能从存储中读取这些key的值
 	//   == v              -> k is readable (from storage+versionedData) @ [storageVersion,v], and not being updated
-	//   when version increases
+	//   when version increases 键k是可读的，可以从存储或versionedData中读取
 	//   == latestVersion  -> k is readable (from storage+versionedData) @ [storageVersion,version.get()], and thus
 	//   stays available when version increases
+	//记录每个key range的最新可用版本，确保在读取数据时能够正确判断哪些key range是可用的
 	CoalescedKeyRangeMap<Version> newestAvailableVersion;
 
 	CoalescedKeyRangeMap<Version> newestDirtyVersion; // Similar to newestAvailableVersion, but includes (only) keys
@@ -892,18 +898,23 @@ public:
 		promise.sendError(err);
 	}
 
+	//readGuard是一个在处理请求前进行检查的模板函数，目的是在服务器过载时拒绝请求，防止进一步的过载
 	template <class Request, class HandleFunction>
 	Future<Void> readGuard(const Request& request, const HandleFunction& fun) {
+		//获取当前处理速率
 		auto rate = currentRate();
+		//检查速率并决定是否拒绝请求
 		if (rate < SERVER_KNOBS->STORAGE_DURABILITY_LAG_REJECT_THRESHOLD &&
 		    deterministicRandom()->random01() >
 		        std::max(SERVER_KNOBS->STORAGE_DURABILITY_LAG_MIN_RATE,
 		                 rate / SERVER_KNOBS->STORAGE_DURABILITY_LAG_REJECT_THRESHOLD)) {
 			// request.error = future_version();
+			//拒绝请求并发送错误
 			sendErrorWithPenalty(request.reply, server_overloaded(), getPenalty());
 			++counters.readsRejected;
 			return Void();
 		}
+		//处理请求
 		return fun(this, request);
 	}
 };
@@ -1110,44 +1121,57 @@ ACTOR Future<Version> waitForVersionNoTooOld(StorageServer* data, Version versio
 	}
 }
 
+//真正执行getValue的函数
 ACTOR Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 	state int64_t resultSize = 0;
 
 	try {
-		++data->counters.getValueQueries;
-		++data->counters.allQueries;
-		++data->readQueueSizeMetric;
+		//更新计数器
+		++data->counters.getValueQueries;//当前getValue请求数量
+		++data->counters.allQueries;//所有类型的请求总数
+		++data->readQueueSizeMetric;//读取队列大小
 		data->maxQueryQueue = std::max<int>(
 		    data->maxQueryQueue, data->counters.allQueries.getValue() - data->counters.finishedQueries.getValue());
 
 		// Active load balancing runs at a very high priority (to obtain accurate queue lengths)
 		// so we need to downgrade here
+		//由于serverGetValueRequests运行在非常高的优先级，在处理请求之前会降低任务优先级并等待一段时间，避免高优先级任务占用过多的资源
 		wait(data->getQueryDelay());
 
+		//记录debug信息
 		if (req.debugID.present())
 			g_traceBatch.addEvent("GetValueDebug",
 			                      req.debugID.get().first(),
 			                      "getValueQ.DoRead"); //.detail("TaskID", g_network->getCurrentTask());
-
+		//初始化返回值
 		state Optional<Value> v;
+		//返回多版本值
+		state std::vector<std::pair<Version, Optional<Value>>> versionedValues;
+
+		//等待请求的读版本可用
 		state Version version = wait(waitForVersion(data, req.version));
+
+		//记录debug信息
 		if (req.debugID.present())
 			g_traceBatch.addEvent("GetValueDebug",
 			                      req.debugID.get().first(),
 			                      "getValueQ.AfterVersion"); //.detail("TaskID", g_network->getCurrentTask());
 
 		state uint64_t changeCounter = data->shardChangeCounter;
-
+		//检查req.key所在分片是否可读
 		if (!data->shards[req.key]->isReadable()) {
 			//TraceEvent("WrongShardServer", data->thisServerID).detail("Key", req.key).detail("Version", version).detail("In", "getValueQ");
 			throw wrong_shard_server();
 		}
 
+		//从存储中检索键值，检索过程分为两步：
 		state int path = 0;
-		auto i = data->data().at(version).lastLessOrEqual(req.key);
+		//1.内存中的版本化数据：先从VersionedMap中检索数据（这里应该就是5s内的版本数据了）
+		auto i = data->data().at(version).lastLessOrEqual(req.key);	
 		if (i && i->isValue() && i.key() == req.key) {
 			v = (Value)i->getValue();
 			path = 1;
+		//2.否则从持久化存储中检索数据（SSD硬盘）
 		} else if (!i || !i->isClearTo() || i->getEndKey() <= req.key) {
 			path = 2;
 			Optional<Value> vv = wait(data->storage.readValue(req.key, req.debugID));
@@ -1160,6 +1184,11 @@ ACTOR Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 			v = vv;
 		}
 
+		if (req.getAllVersions == true) {
+			versionedValues = data->data().getAllVersionsOfKey(req.key, version);
+		}
+
+		//记录debug信息
 		debugMutation("ShardGetValue",
 		              version,
 		              MutationRef(MutationRef::DebugKey, req.key, v.present() ? v.get() : LiteralStringRef("<null>")));
@@ -1178,6 +1207,7 @@ ACTOR Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 		data->metrics.notify(req.key, m);
 		*/
 
+		//更新计数器
 		if (v.present()) {
 			++data->counters.rowsQueried;
 			resultSize = v.get().size();
@@ -1186,6 +1216,7 @@ ACTOR Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 			++data->counters.emptyQueries;
 		}
 
+		//记录读取的字节数，用于统计和监控
 		if (SERVER_KNOBS->READ_SAMPLING_ENABLED) {
 			// If the read yields no value, randomly sample the empty read.
 			int64_t bytesReadPerKSecond =
@@ -1199,7 +1230,11 @@ ACTOR Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 			                      req.debugID.get().first(),
 			                      "getValueQ.AfterRead"); //.detail("TaskID", g_network->getCurrentTask());
 
+		//构造reply并发送响应
 		GetValueReply reply(v);
+		if (req.getAllVersions == true) {
+			reply.versionedValues = versionedValues;
+		}
 		reply.penalty = data->getPenalty();
 		req.reply.send(reply);
 	} catch (Error& e) {
@@ -1207,12 +1242,13 @@ ACTOR Future<Void> getValueQ(StorageServer* data, GetValueRequest req) {
 			throw;
 		data->sendErrorWithPenalty(req.reply, e, data->getPenalty());
 	}
-
+	//更新计数器
 	data->transactionTagCounter.addRequest(req.tags, resultSize);
 
 	++data->counters.finishedQueries;
 	--data->readQueueSizeMetric;
 
+	//记录读取延迟
 	double duration = g_network->timer() - req.requestTime();
 	data->counters.readLatencySample.addMeasurement(duration);
 	if (data->latencyBandConfig.present()) {
@@ -4309,8 +4345,10 @@ ACTOR Future<Void> checkBehind(StorageServer* self) {
 	}
 }
 
+//fdbclient的getValue应该就是发送rpc到这个函数进行处理的
 ACTOR Future<Void> serveGetValueRequests(StorageServer* self, FutureStream<GetValueRequest> getValue) {
 	loop {
+		//等待下一个GetValueRequest请求
 		GetValueRequest req = waitNext(getValue);
 		// Warning: This code is executed at extremely high priority (TaskPriority::LoadBalancedEndpoint), so downgrade
 		// before doing real work
@@ -4319,9 +4357,11 @@ ACTOR Future<Void> serveGetValueRequests(StorageServer* self, FutureStream<GetVa
 			                      req.debugID.get().first(),
 			                      "storageServer.received"); //.detail("TaskID", g_network->getCurrentTask());
 
+		//如果启用了某种设置并且请求的key在normalKeys范围内，直接返回空回复
+		//推测这里的normalKeys指的是fdb的元数据，/xff开头的一系列键值对，这些kv不应该被查到
 		if (SHORT_CIRCUT_ACTUAL_STORAGE && normalKeys.contains(req.key))
 			req.reply.send(GetValueReply());
-		else
+		else //否则将请求添加到actors列表中进行实际处理
 			self->actors.add(self->readGuard(req, getValueQ));
 	}
 }
@@ -4382,22 +4422,28 @@ ACTOR Future<Void> reportStorageServerState(StorageServer* self) {
 	}
 }
 
+//SS存储服务器的核心函数，执行和管理与SS相关的各种任务
+//通过一个loop来处理多个异步任务
 ACTOR Future<Void> storageServerCore(StorageServer* self, StorageServerInterface ssi) {
 	state Future<Void> doUpdate = Void();
 	state bool updateReceived =
 	    false; // true iff the current update() actor assigned to doUpdate has already received an update from the tlog
+	//记录上次循环开始的时间，用于检测循环的延迟
 	state double lastLoopTopTime = now();
 	state Future<Void> dbInfoChange = Void();
 	state Future<Void> checkLastUpdate = Void();
 	state Future<Void> updateProcessStatsTimer = delay(SERVER_KNOBS->FASTRESTORE_UPDATE_PROCESS_STATS_INTERVAL);
 
+	//添加初始任务，将多个异步任务添加到actors中
 	self->actors.add(updateStorage(self));
 	self->actors.add(waitFailureServer(ssi.waitFailure.getFuture()));
 	self->actors.add(self->otherError.getFuture());
 	self->actors.add(metricsCore(self, ssi));
 	self->actors.add(logLongByteSampleRecovery(self->byteSampleRecovery));
 	self->actors.add(checkBehind(self));
+	//处理获取单个key的请求
 	self->actors.add(serveGetValueRequests(self, ssi.getValue.getFuture()));
+	//处理获取key range的请求
 	self->actors.add(serveGetKeyValuesRequests(self, ssi.getKeyValues.getFuture()));
 	self->actors.add(serveGetKeyRequests(self, ssi.getKey.getFuture()));
 	self->actors.add(serveWatchValueRequests(self, ssi.watchValue.getFuture()));
@@ -4410,9 +4456,11 @@ ACTOR Future<Void> storageServerCore(StorageServer* self, StorageServerInterface
 
 	self->coreStarted.send(Void());
 
+	//主循环不断执行以下操作，以保持存储服务器的正常运行：
 	loop {
+		//1.更新循环计数器
 		++self->counters.loops;
-
+		//2.计算和检测循环延迟，如果超过0.05s，则有1%概率记录一个警告
 		double loopTopTime = now();
 		double elapsedTime = loopTopTime - lastLoopTopTime;
 		if (elapsedTime > 0.050) {
@@ -4421,7 +4469,9 @@ ACTOR Future<Void> storageServerCore(StorageServer* self, StorageServerInterface
 		}
 		lastLoopTopTime = loopTopTime;
 
+		//3.选择等待的任务
 		choose {
+			//检测是否超过了时间间隔
 			when(wait(checkLastUpdate)) {
 				if (now() - self->lastUpdate >= CLIENT_KNOBS->NO_RECENT_UPDATES_DURATION) {
 					self->noRecentUpdates.set(true);
@@ -4431,6 +4481,7 @@ ACTOR Future<Void> storageServerCore(StorageServer* self, StorageServerInterface
 					    delay(std::max(CLIENT_KNOBS->NO_RECENT_UPDATES_DURATION - (now() - self->lastUpdate), 0.1));
 				}
 			}
+			//监听数据库信息变化，更新日志系统和延迟带宽撇嘴
 			when(wait(dbInfoChange)) {
 				TEST(self->logSystem); // shardServer dbInfo changed
 				dbInfoChange = self->db->onChange();
@@ -4466,6 +4517,7 @@ ACTOR Future<Void> storageServerCore(StorageServer* self, StorageServerInterface
 					}
 				}
 			}
+			//处理获取分片状态的请求
 			when(GetShardStateRequest req = waitNext(ssi.getShardState.getFuture())) {
 				if (req.mode == GetShardStateRequest::NO_WAIT) {
 					if (self->isReadable(req.keys))
@@ -4476,12 +4528,15 @@ ACTOR Future<Void> storageServerCore(StorageServer* self, StorageServerInterface
 					self->actors.add(getShardStateQ(self, req));
 				}
 			}
+			//获取存储队列的度量指标
 			when(StorageQueuingMetricsRequest req = waitNext(ssi.getQueuingMetrics.getFuture())) {
 				getQueuingMetrics(self, req);
 			}
+			//获取键值存储的类型
 			when(ReplyPromise<KeyValueStoreType> reply = waitNext(ssi.getKeyValueStoreType.getFuture())) {
 				reply.send(self->storage.getKeyValueStoreType());
 			}
+			//执行更新操作
 			when(wait(doUpdate)) {
 				updateReceived = false;
 				if (!self->logSystem)
@@ -4489,10 +4544,12 @@ ACTOR Future<Void> storageServerCore(StorageServer* self, StorageServerInterface
 				else
 					doUpdate = update(self, &updateReceived);
 			}
+			//更新进程的统计信息
 			when(wait(updateProcessStatsTimer)) {
 				updateProcessStats(self);
 				updateProcessStatsTimer = delay(SERVER_KNOBS->FASTRESTORE_UPDATE_PROCESS_STATS_INTERVAL);
 			}
+			//等待所有异步任务的结果
 			when(wait(self->actors.getResult())) {}
 		}
 	}
